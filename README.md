@@ -29,8 +29,9 @@ The MCU runs a NetXDuo TCP echo server on port 6000 using the standard
 `Nx_TCP_Echo_Server/NetXDuo/App/app_netxduo.c` lines 322–374).
 
 A test client (this directory's `client.py`) repeatedly connects, sends
-one byte, reads the echo, and disconnects.  After **5–80 successful
-cycles** — the count varies run to run — one of two things happens:
+one byte, reads the echo, and disconnects.  After some number of
+successful cycles — anywhere from 15 to 2600+, varies wildly run to run
+— one of two things happens:
 
 ### Failure mode A: BusFault inside `_nx_ip_packet_send`
 
@@ -71,17 +72,65 @@ send.
 ### Failure mode B: silent hang
 
 Other runs hit a quieter failure: after some number of successful
-cycles the MCU's control thread is alive (the LED keeps blinking,
-the ST-Link console is responsive) but `nx_tcp_server_socket_accept`
-stops returning.  New TCP SYNs from the client time out.  No fault is
+cycles the IP/TCP stack stops making forward progress.  No fault is
 raised.  The packet pool stays at its normal `46/48` available — so
 this is **not** packet-pool exhaustion.
 
-We have not been able to pin down where exactly the IP stack wedges
-in this mode without instrumentation that itself perturbs the timing
-enough to change the failure rate.  Both modes are reproducible against
-the same unmodified sample, so we believe they are two faces of the
-same underlying state corruption.
+The Python client gives up first, with one of:
+
+* `socket.timeout` (the server stops sending the echo / stops accepting)
+* `ConnectionResetError` (the server tears the socket down without
+  shutting down the listener)
+
+Mode B is what we observe overwhelmingly often once a HardFault dump
+handler is wired in (see "Diagnostics" below): in 20 consecutive runs
+against the unmodified sample we got mode B every time and mode A
+zero times.  This suggests mode B is the dominant signature on this
+firmware/board combination, and that mode A as observed in our own
+application is triggered by app-side timing differences (different
+thread priorities, additional threads competing for the IP mutex,
+different traffic mix) rather than by the TCP echo workload alone.
+
+#### Slow drift before the hang
+
+Watching the green LED (which the sample toggles before and after
+each `nx_tcp_socket_send`) makes the failure surprisingly visible:
+
+* For the first few hundred cycles the LED *flickers* — `send`
+  returns in milliseconds, so it spends almost no time between toggles.
+* Over hundreds to thousands of cycles the flicker progressively
+  smooths into the LED looking more "on than off".  The send latency
+  is growing.
+* Eventually the LED is either stuck **on** (thread wedged inside
+  `nx_tcp_socket_send`, between the toggle on `app_netxduo.c:344` and
+  the toggle on `app_netxduo.c:360`) or stuck **off** (thread wedged
+  inside `nx_tcp_socket_receive` or `nx_tcp_server_socket_accept`).
+
+This monotone slowdown is consistent with a slow leak / queue-walk
+hypothesis: each cycle leaves a packet on
+`nx_tcp_socket_transmit_sent_head` that never gets released.  As the
+queue grows, the IP thread spends more and more time walking it on
+its periodic timer and on each new send, until something deeper
+wedges (likely an internal mutex or a corrupted queue link).
+
+#### A timer-vs-wait gotcha in the sample
+
+The sample's `nx_user.h` defines `NX_IP_PERIODIC_RATE` as **1000**
+but does *not* override `TX_TIMER_TICKS_PER_SECOND`, which stays at
+the ThreadX default of **100**.  The sample then passes
+`NX_IP_PERIODIC_RATE` as a *wait value* to ThreadX:
+
+```c
+ret = nx_tcp_server_socket_accept(&TCPSocket, NX_IP_PERIODIC_RATE);
+ret = nx_tcp_socket_send(&TCPSocket, data_packet, NX_IP_PERIODIC_RATE);
+```
+
+The intent is "wait 1 second", but at 100 ticks/sec the actual wait
+is **10 seconds**.  This isn't the bug — the bug is real even with a
+correct timeout — but it explains why the Python client (5 sec
+timeout) always gives up before the server times out, so the failure
+always presents as a client-side `socket.timeout` /
+`ConnectionResetError` instead of a clean server-side error code.
 
 ## Why we think it's NetXDuo, not the application
 
@@ -158,35 +207,37 @@ Reproduced against ST's unmodified sample on:
 * STM32CubeU5 1.8.0
 * arm-none-eabi-gcc 15.2.1
 
-A typical run hits one of the failure modes within 5–80 client cycles.
-On one recorded run we got `ConnectionResetError` after 35 cycles
-(failure mode B — silent hang, no fault dump).
+20 consecutive runs (each starting from a power-on reset) all hit
+failure mode B with these cycle counts before the client gave up:
 
-### Add a HardFault diagnostic (optional, for failure mode A)
-
-By default ST's `HardFault_Handler` is a silent infinite loop, which
-makes failure mode A invisible.  Replace it with something that prints
-the stacked PC/LR/CFSR/BFAR before halting — for example:
-
-```c
-__attribute__((naked)) void HardFault_Handler(void)
-{
-    __asm volatile (
-        "tst   lr, #4         \n"
-        "ite   eq             \n"
-        "mrseq r0, msp        \n"
-        "mrsne r0, psp        \n"
-        "ldr   r1, =1f        \n"
-        "b     fault_dump     \n"
-        "1: .asciz \"HardFault\" \n"
-        ".align 2             \n"
-    );
-}
+```
+2618, 517, 390, 902, 1283, 594, 532, 223, 279, 1934,
+2427,  352,  71, 445,  117, 216, 294, 618, 217,  15
 ```
 
-(plus a `fault_dump(uint32_t *sp, const char *name)` that pokes USART1
-directly).  Without this, failure mode A looks identical to failure
-mode B from the outside.
+(min 15, max 2618, mean ~702.)  In all 20 runs the diagnostic fault
+handlers (see below) stayed silent — no HardFault, no BusFault, no
+MemManage, no UsageFault dump on the console.  Mode B is real and
+dominant on this hardware against the unmodified sample.
+
+### Diagnostics
+
+`src/fault_dump.c` provides naked `HardFault_Handler`,
+`BusFault_Handler`, `MemManage_Handler`, and `UsageFault_Handler`
+implementations that snapshot the exception frame and write
+`pc / lr / psr / cfsr / hfsr / mmfar / bfar` directly to USART1
+before halting.  ST's `stm32u5xx_it.c` also defines these symbols
+(as silent infinite loops), as does `tx_initialize_low_level.S` for
+HardFault and UsageFault.  The Makefile resolves the conflict by
+linking with `--allow-multiple-definition` and putting our
+`src/fault_dump.o` first in the link order so the linker picks our
+handlers.  No ST source files are modified.
+
+If failure mode A (BusFault inside `_nx_ip_packet_send`) ever fires
+on this build, the dump will appear on the ST-Link VCP at 115200 8N1
+and the LED will freeze in whatever state it was in at the moment of
+the fault.  If you only see the gradual-slowdown / silent-hang
+behavior described above with no fault output, you're seeing mode B.
 
 ### Run the client
 
@@ -224,6 +275,11 @@ which is enough to be useful for development but not production.
 * `README.md` — this file.
 * `Makefile` — builds the unmodified ST sample with `arm-none-eabi-gcc`.
 * `client.py` — minimal Python client that reproduces the failure.
+* `src/fault_dump.c` — diagnostic Cortex-M33 fault handlers
+  (HardFault / BusFault / MemManage / UsageFault) that override the
+  silent infinite loops the sample provides in `stm32u5xx_it.c`.
+  Linked first via `--allow-multiple-definition`.  No ST sources
+  modified.
 * `inc/mx_wifi_conf.h` — copy of ST's `mx_wifi_conf.h` patched only to
   `#include "wifi_secrets.h"` if present (so credentials live outside
   source control).

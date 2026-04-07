@@ -147,12 +147,19 @@ ALL_C_SRCS := $(APP_SRCS) $(HAL_SRCS) $(THREADX_C_SRCS) \
               $(THREADX_PORT_C_SRCS) $(NETXDUO_SRCS) $(MXWIFI_SRCS)
 ALL_ASM_SRCS := $(THREADX_ASM_SRCS)
 
+# Local sources (built from this repo, not from the ST tree).
+# These must come FIRST in the link order so --allow-multiple-definition
+# picks our HardFault/BusFault/MemManage/UsageFault handlers over the
+# silent infinite loops the sample defines in stm32u5xx_it.c.
+LOCAL_C_SRCS := src/fault_dump.c
+
 BUILD_DIR := build
 TARGET    := $(BUILD_DIR)/repro
 
+LOCAL_OBJS := $(patsubst src/%.c,$(BUILD_DIR)/local/%.o,$(LOCAL_C_SRCS))
 C_OBJS := $(patsubst /%,$(BUILD_DIR)/%,$(patsubst %.c,%.o,$(ALL_C_SRCS)))
 ASM_OBJS := $(patsubst /%,$(BUILD_DIR)/%,$(patsubst %.S,%.o,$(ALL_ASM_SRCS)))
-OBJS := $(C_OBJS) $(ASM_OBJS) $(BUILD_DIR)/startup.o
+OBJS := $(LOCAL_OBJS) $(C_OBJS) $(ASM_OBJS) $(BUILD_DIR)/startup.o
 
 CFLAGS := $(MCU) -std=gnu11 -g3 -O2 \
 	-ffunction-sections -fdata-sections \
@@ -187,6 +194,10 @@ $(BUILD_DIR)/%.o: /%.S
 $(BUILD_DIR)/startup.o: $(STARTUP)
 	@mkdir -p $(dir $@)
 	$(AS) $(ASFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/local/%.o: src/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@
 
 $(TARGET).elf: $(OBJS)
 	$(LD) $(OBJS) $(LDFLAGS) -o $@
