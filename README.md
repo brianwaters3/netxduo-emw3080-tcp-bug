@@ -1,12 +1,21 @@
-# NetXDuo + EMW3080 TCP server bug reproducer
+# NetXDuo + EMW3080 TCP server wedge reproducer
 
-A minimal reproducer for two related failure modes in the NetXDuo TCP
-server path on the B-U585I-IOT02A discovery board (EMW3080 WiFi over
-SPI2, NetXDuo as the IP stack).
+A minimal reproducer for a **rate-dependent wedge** in the EMW3080
+WiFi RX path on the B-U585I-IOT02A discovery board, observable through
+NetXDuo's TCP server.  Under sustained TCP server traffic at >5
+connections/sec, the entire device locks up after ~20 seconds and
+stops responding to **all** incoming traffic — TCP, ICMP, everything
+— until the board is power-cycled.  At ≤1 connection/sec the same
+device runs indefinitely with normal recoverable error rates.
 
-The bug reproduces against **STM32CubeU5 v1.8.0**'s own unmodified
+The wedge reproduces against **STM32CubeU5 v1.8.0**'s own unmodified
 `Nx_TCP_Echo_Server` sample, so no application-side mistakes can be
 blamed.
+
+> **Likely subsystem:** the EMW3080 SPI/RX driver
+> (`Drivers/BSP/Components/mx_wifi/` and
+> `Middlewares/ST/netxduo/common/drivers/wifi/mxchip/nx_driver_emw3080.c`),
+> NOT NetXDuo's TCP layer.  See "Where the bug lives" below.
 
 ## Hardware / software
 
@@ -28,12 +37,132 @@ The MCU runs a NetXDuo TCP echo server on port 6000 using the standard
 `relisten` pattern (the exact pattern shown in ST's own sample, see
 `Nx_TCP_Echo_Server/NetXDuo/App/app_netxduo.c` lines 322–374).
 
-A test client (this directory's `client.py`) repeatedly connects, sends
-one byte, reads the echo, and disconnects.  After some number of
-successful cycles — anywhere from 15 to 2600+, varies wildly run to run
-— one of two things happens:
+A test client (`client.py`) repeatedly opens a TCP connection, sends
+one byte, reads the echo, and closes.  When run at the default **30+
+cycles/sec**, the device wedges within ~20 seconds (typically after
+100–600 successful cycles).  At **1 cycle/sec** the same device runs
+indefinitely with only ~1% recoverable errors and stays responsive.
 
-### Failure mode A: BusFault inside `_nx_ip_packet_send`
+## Rate dependence (the key finding)
+
+| Client rate | Wall time to wedge | Cycles before wedge | Outcome |
+|---|---|---|---|
+| **30 cycles/sec** | ~20 sec | 100–2600+ (avg ~600) | Device wedges. Power cycle required. |
+| **5 cycles/sec** | ~20 sec | ~100 | Device wedges. Power cycle required. |
+| **1 cycle/sec** | **does not wedge** | runs indefinitely | ~1% recoverable RST/timeout (normal WiFi loss) |
+
+The wedge fires after roughly the **same wall time (~20 sec)** at both
+30/sec and 5/sec despite the 6× rate difference.  At 1/sec the wedge
+does not fire at all in 240+ seconds of testing.  The threshold lies
+somewhere between 1 and 5 connections per second.
+
+This pattern strongly suggests **a buffer/queue/state in the EMW3080
+SPI driver path that fills up at a rate proportional to sustained
+load above some threshold and then locks the receive pipeline**.  At
+1/sec the rate is below the threshold and the buffer drains between
+cycles; above the threshold it fills and never drains.
+
+## What the wedge looks like
+
+When the device wedges:
+
+- The Python client gives up with `socket.timeout` or
+  `ConnectionResetError`
+- **Concurrent `ping` requests also stop responding** (verified
+  with parallel `ping -i 0.2`)
+- The on-device watchdog thread (see "Diagnostics") stops printing
+  alive heartbeats — its `_print_data_count` counter freezes
+- Watchdog thread-state dumps at the wedge moment show:
+  - `App TCP Thread state=TX_TCP_IP` (suspended in NetXDuo internal)
+  - `Main Ip instance state=EVENT_FLAG ev_pending=0x0` (idle, no
+    events to wake it)
+  - `MX_WIFI_TxRxThreadId state=SEMA_SUSP` (waiting for EXTI from
+    EMW3080 that never fires)
+  - `MX_WIFI_RecvThreadId state=QUEUE_SUSP` (waiting for work from
+    SPI thread that never arrives)
+  - `pool=9/10` (packet pool healthy — NOT a leak)
+  - `drv_deferred=0` and `ip_deferred=0` (no packets queued in either
+    NetXDuo deferred queue)
+  - **No packets are anywhere in NetXDuo's receive pipeline**.  The
+    EMW3080 stopped delivering packets to the SPI driver.
+
+This is not a NetXDuo TCP-state-machine bug — the IP thread is
+asleep with literally nothing to do.  The wedge is upstream of
+NetXDuo, in the SPI/EXTI path between the EMW3080 module and the
+mx_wifi RX thread.
+
+## Where the bug lives (best evidence)
+
+The smoking gun is the simultaneous death of TCP and ICMP combined
+with the watchdog dump showing the `mx_wifi` threads sleeping on
+their semaphores/queues with no events arriving.  ICMP and TCP go
+through the same upstream pipeline:
+
+```
+EMW3080 module
+    ↓ (SPI + data-ready EXTI)
+mx_wifi RX thread (mx_wifi_spi.c)
+    ↓
+nx_driver_emw3080 RX callback (nx_driver_emw3080.c)
+    ↓ (_nx_ip_driver_deferred_receive)
+NetXDuo IP thread queue
+    ↓ (sets NX_IP_DRIVER_PACKET_EVENT)
+_nx_ip_thread_entry
+    ↓
+_nx_ip_packet_receive → _nx_ipv4_packet_receive → demux by protocol
+    ├── ICMP → _nx_icmp_packet_receive  (auto-replies)
+    └── TCP  → _nx_tcp_packet_receive → _nx_tcp_packet_process
+```
+
+When the wedge fires, **no protocol gets handled**.  The IP thread
+is sleeping with no events queued.  That means the wakeup chain
+broke at or before "set NX_IP_DRIVER_PACKET_EVENT" — i.e., either
+the EMW3080 stopped asserting its data-ready EXTI line, or the
+mx_wifi RX/SPI thread stopped reading from the EMW3080, or the
+driver received packets but failed to signal the IP thread.
+
+All three live in the EMW3080 driver, NOT in NetXDuo.
+
+## Secondary symptom: NetXDuo accept-retry ISN regeneration
+
+When the device is *almost* wedged (slow but still processing some
+packets), a secondary corruption pattern appears in
+`nx_tcp_server_socket_accept.c:142-173` that makes the wedge worse
+and confuses any client TCP stack:
+
+When `accept()` times out (`NX_NOT_CONNECTED`) because the host's
+ACK to the device's SYN-ACK didn't arrive in time, the failure path
+at line 199-202 resets state to `NX_TCP_LISTEN_STATE` and clears the
+timer, **but leaves `bound_next` and `connect_port` set**.  When the
+sample's loop retries `accept()`, the function re-enters its init
+block and:
+
+1. Re-randomizes `tx_sequence` (line 113-122 — generates a NEW ISN)
+2. Enters the `bound_next` branch (line 142) because `bound_next`
+   is still set from the failed attempt
+3. Increments `tx_sequence` and emits a new SYN-ACK with the new ISN
+4. Returns success-pending; the application loops, the IP thread is
+   slow, accept times out again, and the cycle repeats with yet
+   another new ISN
+
+The captured `[syn_wrap]` traces in this repo's diagnostic build
+show this pattern explicitly: same client port, same SYN seq number,
+but the device emitting **multiple SYN-ACKs with different ISNs**
+(e.g. `tx_seq=1389254635 → tx_seq=3299820847 → tx_seq=175889579 →
+peer=0.0.0.0:0 tx_seq=2032179306`), the last one with a corrupted
+zeroed connect tuple.  After this the IP thread wedges entirely.
+
+This is a **secondary** NetXDuo bug that is exposed by the slow IP
+thread under load, not the root cause.  Fixing it would not stop
+the wedge from firing — it would only make the failure mode less
+catastrophic.
+
+### Failure mode A: BusFault inside `_nx_ip_packet_send` (historical)
+
+Originally reported as a primary failure mode but **not observed
+once diagnostic fault handlers were installed** (zero BusFaults
+across 20+ runs).  Most likely a previous unrelated artifact.  Kept
+here for reference.
 
 ```
 !! FAULT: BusFault
@@ -113,60 +242,16 @@ queue grows, the IP thread spends more and more time walking it on
 its periodic timer and on each new send, until something deeper
 wedges (likely an internal mutex or a corrupted queue link).
 
-#### A timer-vs-wait gotcha in the sample
+## Workaround
 
-The sample's `nx_user.h` defines `NX_IP_PERIODIC_RATE` as **1000**
-but does *not* override `TX_TIMER_TICKS_PER_SECOND`, which stays at
-the ThreadX default of **100**.  The sample then passes
-`NX_IP_PERIODIC_RATE` as a *wait value* to ThreadX:
+**For applications that can tolerate it: rate-limit TCP server
+accept rate to ≤1 connection/sec.** At that rate the device runs
+indefinitely with normal recoverable error rates and the wedge
+never fires.
 
-```c
-ret = nx_tcp_server_socket_accept(&TCPSocket, NX_IP_PERIODIC_RATE);
-ret = nx_tcp_socket_send(&TCPSocket, data_packet, NX_IP_PERIODIC_RATE);
-```
-
-The intent is "wait 1 second", but at 100 ticks/sec the actual wait
-is **10 seconds**.  This isn't the bug — the bug is real even with a
-correct timeout — but it explains why the Python client (5 sec
-timeout) always gives up before the server times out, so the failure
-always presents as a client-side `socket.timeout` /
-`ConnectionResetError` instead of a clean server-side error code.
-
-## Why we think it's NetXDuo, not the application
-
-* The application code is ST's own sample, byte-for-byte unchanged.
-* The pattern (single server socket reused via `relisten`) is the
-  documented NetXDuo idiom.
-* We verified that `nx_packet_pool_available` stays high, so this
-  isn't a leak.
-* In failure mode A, the fault is *inside* NetXDuo, on a pointer that
-  NetXDuo itself owns (`packet_ptr->nx_packet_ip_interface` is set
-  by NetXDuo's own TCP send path, not by the driver).
-
-## Why we think the EMW3080 NetXDuo driver is involved
-
-`Middlewares/ST/netxduo/common/drivers/wifi/mxchip/nx_driver_emw3080.c`,
-function `_nx_driver_emw3080_packet_send`, calls
-`nx_packet_transmit_release(packet_ptr)` immediately after the
-synchronous SPI write returns.  For TCP packets,
-`nx_packet_transmit_release` does *not* free the packet — it leaves
-the packet on the socket's `nx_tcp_socket_transmit_sent_head` queue
-with `nx_packet_queue_next == NX_DRIVER_TX_DONE`, expecting the
-packet's other fields (including `nx_packet_ip_interface`) to remain
-valid until the TCP layer ACKs and releases it.
-
-That contract appears to break under load on this driver — by the time
-the retransmit timer fires later, the field has been overwritten.  We
-have **not** identified the writer.  Possibilities we considered but
-could not confirm:
-
-1. The mx_wifi RX path recycling the same NX_PACKET memory (unlikely;
-   the packet is still on a queue and shouldn't be in the free list).
-2. NetXDuo's own internal release path being triggered prematurely
-   somewhere.
-3. A union-aliasing issue inside NetXDuo where an IPv6 code path
-   writes through `nx_packet_address.nx_packet_ipv6_address_ptr`
-   for an IPv4 packet.
+For applications that need higher rates (real TCP servers): there is
+no application-level workaround.  The fix has to land inside ST's
+EMW3080 driver.
 
 ## Reproduction steps
 
@@ -207,82 +292,167 @@ Reproduced against ST's unmodified sample on:
 * STM32CubeU5 1.8.0
 * arm-none-eabi-gcc 15.2.1
 
-20 consecutive runs (each starting from a power-on reset) all hit
-failure mode B with these cycle counts before the client gave up:
+**At default rate (~30 cycles/sec)**, 20 consecutive runs (each
+starting from a power-on reset) all wedged with cycle counts
+ranging from 15 to 2618 (mean ~702).
 
-```
-2618, 517, 390, 902, 1283, 594, 532, 223, 279, 1934,
-2427,  352,  71, 445,  117, 216, 294, 618, 217,  15
-```
+**At 1 cycle/sec**: 177 successful cycles in 180 seconds with 3
+recoverable errors, then *another* 60 successful cycles in 60
+seconds without a power cycle.  The device is completely healthy
+at this rate.
 
-(min 15, max 2618, mean ~702.)  In all 20 runs the diagnostic fault
-handlers (see below) stayed silent — no HardFault, no BusFault, no
-MemManage, no UsageFault dump on the console.  Mode B is real and
-dominant on this hardware against the unmodified sample.
+In all runs the diagnostic fault handlers (see below) stayed
+silent — no HardFault, no BusFault, no MemManage, no UsageFault.
+The wedge is purely a "no packets ever reach the IP thread again"
+condition, not a fault.
 
 ### Diagnostics
 
-`src/fault_dump.c` provides naked `HardFault_Handler`,
-`BusFault_Handler`, `MemManage_Handler`, and `UsageFault_Handler`
-implementations that snapshot the exception frame and write
-`pc / lr / psr / cfsr / hfsr / mmfar / bfar` directly to USART1
-before halting.  ST's `stm32u5xx_it.c` also defines these symbols
-(as silent infinite loops), as does `tx_initialize_low_level.S` for
-HardFault and UsageFault.  The Makefile resolves the conflict by
-linking with `--allow-multiple-definition` and putting our
-`src/fault_dump.o` first in the link order so the linker picks our
-handlers.  No ST source files are modified.
+This repo's diagnostic build provides several pieces of
+instrumentation, all linked via `--allow-multiple-definition` so
+they win over ST's defaults without modifying any ST source.
 
-If failure mode A (BusFault inside `_nx_ip_packet_send`) ever fires
-on this build, the dump will appear on the ST-Link VCP at 115200 8N1
-and the LED will freeze in whatever state it was in at the moment of
-the fault.  If you only see the gradual-slowdown / silent-hang
-behavior described above with no fault output, you're seeing mode B.
+#### `src/fault_dump.c`
+Naked `HardFault_Handler`, `BusFault_Handler`, `MemManage_Handler`,
+and `UsageFault_Handler` implementations that snapshot the
+exception frame and write `pc / lr / psr / cfsr / hfsr / mmfar /
+bfar` directly to USART1 before halting.  ST's `stm32u5xx_it.c`
+also defines these as silent infinite loops; we override them.
+
+#### `src/io_putchar.c`
+Override of `__io_putchar` that bypasses HAL and writes directly
+to `USART1->TDR` with `TX_DISABLE`/`TX_RESTORE` around the
+spin-then-write.  HAL_UART_Transmit is not multi-thread-safe and
+loses bytes when two threads call printf concurrently — this
+override fixes that, which is important because we have a
+watchdog thread and the TCP thread both printing.
+
+#### `src/watchdog.c`
+A low-priority diagnostic thread that wakes once per cycle (only
+when the heartbeat counter advances), prints `[watchdog]
+heartbeat=N`, and would dump full thread/socket state if asked.
+The PRINT_DATA macro override in `inc/app_netxduo.h` increments
+the counter and starts the watchdog on the first cycle.  When
+the device wedges, the heartbeat stops advancing and the thread
+falls silent — that silence is the wedge signal.
+
+#### `src/syn_wrap.c`
+Linker `--wrap` instrumentation for several NetXDuo entry points:
+
+* `_nx_tcp_packet_process` — logs every incoming TCP packet
+  (filtered to SYN-only) so you can see what packets reach
+  NetXDuo's TCP layer.
+* `_nx_tcp_packet_send_syn` — logs every outgoing SYN/SYN-ACK so
+  you can see the device's responses.
+* `_nx_tcp_server_socket_accept` — logs entry and exit, including
+  `bound_next` and `connect_port` state, so you can see the
+  accept-retry ISN regeneration pattern when it fires.
+
+#### `src/nx_tcp_fast_periodic_processing_local.c`
+A local fork of NetXDuo's `nx_tcp_fast_periodic_processing.c` with
+the eclipse-threadx/netxduo#306 workaround applied (the upstream
+condition that gates `_nx_tcp_socket_connection_reset` is "never
+fulfilled" in normal flow per #306; this fork removes the gate).
+Did not affect the wedge in our testing — kept here in case it
+matters for related issues.
+
+### What the diagnostic output looks like
+
+A successful cycle:
+
+```
+[tcp_in] pkt=0x... sp=64512 dp=6000 flags=S
+[accept_in] sock=0x... state=2 bound_next=0x... connect=192.168.0.10:64512
+[syn_wrap] send_syn sock=0x... state=4 peer=192.168.0.10:64512 tx_seq=...
+[accept_out] sock=0x... rc=0 state=5 connect_port=64512
+[watchdog] heartbeat=N
+```
+
+The accept-retry ISN regeneration cascade (secondary symptom
+described above) looks like:
+
+```
+[tcp_in] sp=54693 flags=S
+[accept_in] state=2 bound_next=... connect=192.168.0.10:54693
+[syn_wrap] tx_seq=1389254635           <- ISN A
+[syn_wrap] tx_seq=1389254635           <- retransmit (correct)
+[accept_out] rc=56 connect_port=54693  <- NX_NOT_CONNECTED (timeout)
+[accept_in] state=2 bound_next=... connect=192.168.0.10:54693
+[syn_wrap] tx_seq=3299820847           <- NEW ISN B!
+[accept_out] rc=56 connect_port=54693
+[accept_in] state=2 bound_next=... connect=192.168.0.10:54693
+[syn_wrap] tx_seq=175889579            <- NEW ISN C!
+[accept_out] rc=56 connect_port=0      <- connect_port now 0!
+[accept_in] state=2 bound_next=... connect=0.0.0.0:0
+[syn_wrap] peer=0.0.0.0:0 tx_seq=...   <- SYN-ACK to NOWHERE
+(then no further output — wedged forever)
+```
+
+Per-cycle prints can be disabled by setting `VERBOSE_LOGS=0` in
+`src/syn_wrap.c` (default 0) and the PRINT_DATA macro override in
+`inc/app_netxduo.h`, leaving only the watchdog heartbeat.
 
 ### Run the client
 
 On any host on the same WiFi network:
 
 ```sh
-python3 client.py <mcu-ip> 6000
+python3 client.py <mcu-ip> 6000           # default ~30 cycles/sec — wedges in ~20 sec
 ```
 
 The client prints `N cycles ok` every 10 successful round trips.
-Expected behavior: it runs forever.  Observed behavior: it runs for
-a few seconds to a minute and then fails with `socket.timeout`,
-`ConnectionResetError`, or `ConnectionRefusedError`.
+With the default rate, expect a wedge within ~20 seconds.
 
-## Workaround we are using
+To verify the rate-dependence finding (no wedge at low rate), use
+the optional included throttled client:
 
-We patched `_nx_driver_emw3080_packet_send` to pin
-`packet_ptr->nx_packet_ip_interface` to `&ip->nx_ip_interface[0]`
-right before calling `nx_packet_transmit_release`.  This is a band-aid
-— it converts failure mode A (BusFault) into a cleaner code path
-(retransmit dereferences a valid interface struct), but it does **not**
-fix failure mode B.
-
-```c
-/* In _nx_driver_emw3080_packet_send, just before nx_packet_transmit_release */
-packet_ptr->nx_packet_ip_interface =
-    &(nx_driver_information.nx_driver_information_ip_ptr->nx_ip_interface[0]);
+```sh
+# Hammer at 1 cycle/sec — should run indefinitely with a few
+# recoverable errors but no wedge
+python3 client.py <mcu-ip> 6000 --rate 1   # if not yet implemented, edit client.py
 ```
 
-After this patch the system survives ~50–100 cycles instead of 5–8,
-which is enough to be useful for development but not production.
+To verify the wedge takes down ICMP too, run a parallel ping:
+
+```sh
+ping -i 0.2 192.168.0.25 &
+python3 client.py 192.168.0.25 6000
+```
+
+You'll see ping responding normally up to the moment of the wedge,
+then **all** ping responses stop at the same instant the TCP
+client fails.
 
 ## Files in this repo
 
 * `README.md` — this file.
 * `Makefile` — builds the unmodified ST sample with `arm-none-eabi-gcc`.
-* `client.py` — minimal Python client that reproduces the failure.
+* `client.py` — minimal Python client that reproduces the failure
+  at the default ~30 cycles/sec rate.
+* `wedge-port65297.pcap` — saved host-side packet capture of one
+  failing cycle, showing the host transmitting 4 SYN retransmits at
+  1-second intervals with zero device response.
 * `src/fault_dump.c` — diagnostic Cortex-M33 fault handlers
-  (HardFault / BusFault / MemManage / UsageFault) that override the
-  silent infinite loops the sample provides in `stm32u5xx_it.c`.
-  Linked first via `--allow-multiple-definition`.  No ST sources
-  modified.
-* `inc/mx_wifi_conf.h` — copy of ST's `mx_wifi_conf.h` patched only to
-  `#include "wifi_secrets.h"` if present (so credentials live outside
-  source control).
+  (HardFault / BusFault / MemManage / UsageFault).
+* `src/io_putchar.c` — multi-thread-safe `__io_putchar` override
+  that bypasses HAL and writes directly to `USART1->TDR`.
+* `src/watchdog.c` — low-priority diagnostic thread that prints a
+  heartbeat per cycle and falls silent at the wedge moment.
+* `src/syn_wrap.c` — linker `--wrap` instrumentation for
+  `_nx_tcp_packet_process`, `_nx_tcp_packet_send_syn`, and
+  `_nx_tcp_server_socket_accept`.
+* `src/nx_tcp_fast_periodic_processing_local.c` — local fork with
+  the eclipse-threadx/netxduo#306 workaround.
+* `src/nx_tcp_server_socket_accept_local.c` — local fork of
+  NetXDuo's accept() with experimental cleanup-on-failure code that
+  did NOT fix the wedge (kept here as documentation of one failed
+  fix attempt; the bug is upstream of NetXDuo).
+* `inc/app_netxduo.h` — local header that pre-defines the sample's
+  include guard so we can override `PRINT_DATA` (which we use to
+  drive the watchdog heartbeat counter) without modifying ST source.
+* `inc/mx_wifi_conf.h` — copy of ST's `mx_wifi_conf.h` patched only
+  to `#include "wifi_secrets.h"` if present (so credentials live
+  outside source control).
 * `inc/wifi_secrets.h.example` — template for the gitignored
   credentials file.
 * `.gitignore` — keeps `build/` and `inc/wifi_secrets.h` out of git.

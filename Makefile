@@ -46,7 +46,9 @@ DEFS := \
 	-DUSE_FULL_ASSERT \
 	-DTX_INCLUDE_USER_DEFINE_FILE \
 	-DNX_INCLUDE_USER_DEFINE_FILE \
-	-DNX_DRIVER_DEFERRED_PROCESSING
+	-DNX_DRIVER_DEFERRED_PROCESSING \
+	-DNX_PACKET_HEADER_PAD \
+	-DNX_PACKET_HEADER_PAD_SIZE=4
 
 # Include paths.  Order matters: our local inc/ comes FIRST so the
 # sample picks up our copy of mx_wifi_conf.h (with credentials) before
@@ -151,7 +153,7 @@ ALL_ASM_SRCS := $(THREADX_ASM_SRCS)
 # These must come FIRST in the link order so --allow-multiple-definition
 # picks our HardFault/BusFault/MemManage/UsageFault handlers over the
 # silent infinite loops the sample defines in stm32u5xx_it.c.
-LOCAL_C_SRCS := src/fault_dump.c
+LOCAL_C_SRCS := src/io_putchar.c src/fault_dump.c src/nx_tcp_fast_periodic_processing_local.c src/nx_tcp_server_socket_accept_local.c src/watchdog.c src/syn_wrap.c
 
 BUILD_DIR := build
 TARGET    := $(BUILD_DIR)/repro
@@ -167,6 +169,12 @@ CFLAGS := $(MCU) -std=gnu11 -g3 -O2 \
 	$(DEFS) $(INCS) \
 	--specs=nano.specs
 
+# Compile only the sample's app_netxduo.c with our PRINT_DATA override
+# pre-included.  Applying -include globally would break NetXDuo's own
+# middleware sources that also pull in nx_api.h with their own setup.
+APP_NETXDUO_OBJ := $(patsubst /%,$(BUILD_DIR)/%,$(patsubst %.c,%.o,$(SAMPLE)/NetXDuo/App/app_netxduo.c))
+$(APP_NETXDUO_OBJ): CFLAGS += -include $(CURDIR)/inc/app_netxduo.h
+
 ASFLAGS := $(MCU) -g3 $(DEFS) $(INCS)
 
 LDFLAGS := $(MCU) \
@@ -176,6 +184,9 @@ LDFLAGS := $(MCU) \
 	-Wl,--allow-multiple-definition \
 	-Wl,--defsym=__RAM_segment_used_end__=_end \
 	-Wl,--defsym=_vectors=g_pfnVectors \
+	-Wl,--wrap=_nx_tcp_packet_send_syn \
+	-Wl,--wrap=_nx_tcp_packet_process \
+	-Wl,--wrap=_nx_tcp_server_socket_accept \
 	-Wl,-Map=$(TARGET).map \
 	-lc -lm -lnosys
 
